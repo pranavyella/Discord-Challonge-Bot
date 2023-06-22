@@ -1,8 +1,9 @@
-import os, discord, asyncio, challonge, requests
+import os, discord, asyncio, challonge, requests, sqlite3
 from socket import timeout
 from urllib.error import HTTPError
 from dotenv import load_dotenv
 from discord.ext import commands
+
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
@@ -10,7 +11,7 @@ user = os.getenv('CHALLONGE_USER')
 api_key = os.getenv('CHALLONGE_KEY')
 challonge.set_credentials(user, api_key)
 
-bot = commands.Bot(command_prefix = '.')
+bot = commands.Bot(command_prefix = '.', intents=discord.Intents.all())
 
 tournaments = challonge.tournaments.index()
 latest_tourney = tournaments[len(tournaments) - 1]
@@ -21,10 +22,24 @@ matches = challonge.matches.index(latest_tourney['url'])
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
+    conn = sqlite3.connect('discord_to_challonge.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS discord_to_challonge (
+            discord_id TEXT,
+            discord_name TEXT,
+            challonge_id TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
     
 @bot.command()
 @commands.has_role('T.O.')
 async def createtournament(ctx):
+
     def check(msg):
         return msg.author == ctx.author and msg.channel == ctx.channel
     
@@ -74,6 +89,49 @@ async def deletetournament(ctx):
     except discord.ext.commands.errors.MissingRole:
         await ctx.send("You must be a T.O. in order to use this command.")
 
+
+async def tourney_loop():
+    channel_names = ['lobby-1', 'lobby-2', 'lobby-3', 'lobby-4', 'lobby-5']
+    for i in range(0, 5):
+        guild = bot.get_guild(881993436962392872)
+        await guild.create_text_channel(channel_names[i])
+
+    while latest_tourney['state'] != 'complete':
+        channel_idx = 0
+        all_matches_completed = True
+        #go through the list of matches and start a thread with the two players in an ongoing match in the next available channel
+        for match in matches:
+            
+            if match['state'] == 'open':
+                all_matches_completed = False
+                user1 = match['player1_id']
+                user2 = match['player2_id']
+
+                #find the discord id of the two players
+                conn = sqlite3.connect('discord_to_challonge.db')
+                cursor = conn.cursor()
+                cursor.execute('SELECT discord_id FROM discord_to_challonge WHERE challonge_id = ?', (user1,))
+                user1_discord_id = cursor.fetchone()
+                cursor.execute('SELECT discord_id FROM discord_to_challonge WHERE challonge_id = ?', (user2,))
+                user2_discord_id = cursor.fetchone()
+                conn.close()
+                
+                #start a thread with the two players in the next available channel
+                guild = bot.get_guild(881993436962392872)
+                channel = guild.get_channel(channel_names[channel_idx])
+                thread = await channel.create_thread(name="Match between " + user1_discord_id + " and " + user2_discord_id)
+                await thread.send("@{} @{}".format(user1_discord_id, user2_discord_id)) #pings both users in the created thread
+
+                match['state'] = 'pending'
+
+                channel_idx += 1
+                if channel_idx == 5:
+                    channel_idx = 0
+                
+        if all_matches_completed:
+            break
+
+
 @bot.command()
 @commands.has_role('T.O.')
 async def starttournament(ctx):
@@ -89,6 +147,9 @@ async def starttournament(ctx):
         if yes_or_no == 'Y'.lower() or yes_or_no == 'Yes'.lower():
             challonge.tournaments.start(ch_subdomain + "-" + latest_tourney['url'])
             await ctx.send(latest_tourney['name'] + ' has started!')
+
+            tourney_loop()
+            await ctx.send(latest_tourney['name'] + ' has ended!')
         else: 
             await ctx.send(latest_tourney['name'] + ' will not be started.')
             
@@ -101,12 +162,47 @@ async def starttournament(ctx):
     except challonge.api.ChallongeException:
         await ctx.send("Your tournament must have at least 2 active participants to be started.")
     
-    
-    
+
+# Function to check if a user is already registered in the database
+def get_participant_id(user_id):
+    conn = sqlite3.connect('discord_to_challonge.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM discord_to_challonge WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+ 
 @bot.command()
 @commands.has_role('T.O.')
 async def dqplayer(ctx):
-    pass
+    def check(msg):
+        return msg.author == ctx.author and msg.channel == ctx.channel
+    
+    await ctx.channel.send("Are you sure you want to dq? (Y/N)")
+    
+    try:
+        
+        yes_or_no = await bot.wait_for('message', check=check, timeout=30)  
+        
+        if yes_or_no == 'Y'.lower() or yes_or_no == 'Yes'.lower():
+            conn = sqlite3.connect('discord_to_challonge.db')
+            cursor = conn.cursor()
+            cursor.execute('SELECT challonge_id from discord_to_challonge WHERE user_id = ?', (user.id,))
+            result = cursor.fetchone()
+            conn.close()
+            challonge.participants.destroy(ch_subdomain + "-" + latest_tourney['url'], result[0])
+            await ctx.send("Player has been DQ'd.")
+        else:
+            await ctx.send("Player has not been DQ'd.")
+        
+    except asyncio.TimeoutError:
+        await ctx.send("Timeout occurred. Please use the command again.")
+    except requests.exceptions.HTTPError:
+        await ctx.send("That URL extension does not exist. Please use this command again.")
+    except discord.ext.commands.errors.MissingRole:
+        await ctx.send("You must be a T.O. in order to use this command.")
+    except challonge.api.ChallongeException:
+        await ctx.send("Your tournament must have at least 2 active participants to be started.")
 
 @bot.command()
 @commands.has_any_role('Catch Hands Player', 'T.O.')
@@ -117,7 +213,7 @@ async def matchscore(ctx):
     await ctx.send("What was the final score? Please use the following format: '3-2'")
     try:
         score = await bot.wait_for('message', check=check, timeout=30)
-        challonge.matches.update(latest_tourney['url'], 265591700, scores_csv=str(score.content))
+        challonge.matches.update(latest_tourney['url'], 265591700, scores_csv=str(score.content), state='complete')
         await ctx.send("Match updated.")
     
     except asyncio.TimeoutError:
@@ -126,42 +222,75 @@ async def matchscore(ctx):
         await ctx.send("That URL extension does not exist. Please use this command again.")
     except discord.ext.commands.errors.MissingRole:
         await ctx.send("You must be a T.O. in order to use this command.")
-    # except challonge.api.ChallongeException:
-    #     await ctx.send("Your tournament must have at least 2 active participants to be started.")
- 
-@bot.command()
-@commands.has_any_role('T.O.', 'Catch Hands Player')
-async def jointournament(ctx):
-    def check(msg):
-            return msg.author == ctx.author and msg.channel == ctx.channel
-    
-    await ctx.send('''Please enter the name or url extension of the tournament you want to join exactly as it appears.\n
-                    Examples:\nFor Catch Hands Weekly #7, please type Catch Hands Weekly #7 or CHW7\nFor Crazy Hand Proving Grounds #5,
-                    please type Crazy Hands Proving Grounds #5 or CHPG5\nFor Crazy Orders #2, please type Crazy Orders #2 or CO2''')
-    
-    try:
-        tourney_to_join = await bot.wait_for('message', check=check, timeout=30)
-        if(tourney_to_join == latest_tourney['name'] or tourney_to_join == latest_tourney['url']):
-            await ctx.send("success")
 
-    
-    except asyncio.TimeoutError:
-        await ctx.send("Timeout occurred. Please use the command again.")
-    except requests.exceptions.HTTPError:
-        await ctx.send("That URL extension does not exist. Please use this command again.")
-    except discord.ext.commands.errors.MissingRole:
-        await ctx.send("You must be a T.O. in order to use this command.")
-    except challonge.api.ChallongeException:
-        await ctx.send("Your tournament must have at least 2 active participants to be started.")
+
+
+# Function to check if a user is already registered in the database
+def is_user_registered(user_id):
+    conn = sqlite3.connect('discord_to_challonge.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM discord_to_challonge WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
 
 @bot.command()
 @commands.has_any_role('T.O.', 'Catch Hands Player')
 async def signup(ctx):
     await updateLatestTourney()
-    await ctx.send("Here is the sign-up link to the latest tournament: " + str(latest_tourney['sign_up_url']))
+    user = ctx.author
+    await ctx.send("Check your DMs for the sign-up link.")
+    await user.send("Here is the sign-up link to the latest tournament: " + str(latest_tourney['sign_up_url']))
+    await user.send("Please sign up first using the link above and then type anything to continue.")
+    
+    #wait for the user to respond with anything in DMs
+    def check(msg):
+        return msg.author == ctx.author and msg.channel == user.dm_channel
+    await bot.wait_for('message', check=check, timeout=120)
+
+    if not is_user_registered(user.id):
+        participants = challonge.participants.index(ch_subdomain + "-" + latest_tourney['url'])
+
+        for participant in participants:
+            if not is_user_registered(participant['id']):
+                await user.send(f"Is this your challonge account? {participant['name']} (Y/N)")
+                def check(msg):
+                    return msg.author == ctx.author and msg.channel == user.dm_channel
+                
+                yes_or_no = await bot.wait_for('message', check=check, timeout=60)
+                if yes_or_no.content.lower() in ['y', 'yes']:
+
+                    conn = sqlite3.connect('discord_to_challonge.db')
+                    cursor = conn.cursor()
+                    cursor.execute('INSERT OR REPLACE INTO discord_to_challonge (user_id, challonge_id) VALUES (?, ?)',
+                        (user.id, participant['id']))
+                    conn.commit()
+                    conn.close()
+
+                    await user.send("You are now registered in the database.")                  
+                else:
+                    await user.send("An error has occurred. Please use the signup command in CH again.")
+    else:
+        await user.send("You are already registered in the database.")
+
     
 
-        
+@bot.command()
+@commands.has_any_role('T.O.')
+async def printdatabase(ctx):
+    conn = sqlite3.connect('discord_to_challonge.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT user_id, challonge_id FROM discord_to_challonge')
+    rows = cursor.fetchall()
+
+    if len(rows) == 0:
+        await ctx.send('The database is empty.')
+    else:
+        for row in rows:
+            await ctx.send(f'User ID: {row[0]}, Challonge ID: {row[1]}')
+
+    conn.close()
         
 async def updateLatestTourney():
     global tournaments
@@ -170,68 +299,6 @@ async def updateLatestTourney():
     tournaments = challonge.tournaments.index(subdomain=ch_subdomain)
     latest_tourney = tournaments[len(tournaments) - 1]
     
-    
-#helper functions while creating bot
-@bot.command()
-async def listtourneystats(ctx):
-    for tourney in tournaments:
-        for k, v in tourney.items():
-            await ctx.send(k + " ---> " + str(v))
-        
-        
-@bot.command()
-async def listtourneys(ctx):
-    try:
-        await updateLatestTourney()
-        for tourney in tournaments:
-            #skip for loop if tourney id is 5504945
-            if tourney['id'] == 5504945:
-                continue
-            await ctx.send('id' + ' ---> ' + str(tourney['id']))
-            await ctx.send('name' + ' ---> ' + tourney['name'])
-            await ctx.send('url' + ' ---> ' + tourney['url'])
-            await ctx.send('sign-up' + ' ---> ' + str(tourney['open_signup']))
-            await ctx.send('sign up url' + ' ---> ' + str(tourney['sign_up_url']))
-            #await ctx.send('full sign up url' + ' ---> ' + tourney['full_challonge_url'])
-    except IndexError:
-        await ctx.send("This account has created no tournaments.")
-        
-            
-@bot.command()
-async def latesttourney(ctx):
-    await updateLatestTourney
-    await ctx.send('name: ' + latest_tourney['name'])
-    await ctx.send('url: ' + latest_tourney['url'])
-    await ctx.send('sign-up' + ' ---> ' + str(latest_tourney['open_signup']))
-    await ctx.send('sign up url' + ' ---> ' + str(latest_tourney['sign_up_url']))
-    
-@bot.command()
-async def listmatches(ctx):
-    for match in matches:
-        for k, v in match.items():
-            await ctx.send(str(k) + ' ---> ' + str(v) + '\n')
-        
-# General method shell code
-@bot.command()
-@commands.has_any_role('T.O.', 'Catch Hands Player')
-async def join(ctx):
-    def check(msg):
-            return msg.author == ctx.author and msg.channel == ctx.channel
-        
-    await ctx.send("Message")
-    
-    try:
-        variable = await bot.wait_for('message', check=check, timeout=30)
-    
-    except asyncio.TimeoutError:
-        await ctx.send("Timeout occurred. Please use the command again.")
-    except requests.exceptions.HTTPError:
-        await ctx.send("That URL extension does not exist. Please use this command again.")
-    except discord.ext.commands.errors.MissingRole:
-        await ctx.send("You must be a T.O. in order to use this command.")
-    except challonge.api.ChallongeException:
-        await ctx.send("Your tournament must have at least 2 active participants to be started.")
-
 
 #If error here, make sure to save all files
 bot.run(DISCORD_TOKEN)
